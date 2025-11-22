@@ -1,0 +1,310 @@
+"""
+data_fetch.py
+- Fetches historical price data and basic fundamentals using yfinance
+- Saves CSVs in ./data/
+"""
+import os
+from datetime import datetime
+import pandas as pd
+import yfinance as yf
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def fetch_price_history(ticker: str, start: str = "2018-01-01", end: str = None, interval: str = "1d"):
+    """
+    Returns DataFrame with OHLCV for ticker.
+    """
+    if end is None:
+        end = datetime.today().strftime("%Y-%m-%d")
+    print(f"Fetching {ticker} from {start} to {end} interval={interval}")
+    t = yf.Ticker(ticker)
+    df = t.history(start=start, end=end, interval=interval, actions=False).reset_index()
+    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+    df['ticker'] = ticker
+    return df
+
+def fetch_fundamentals(ticker: str):
+    """
+    Fetches basic fundamental statements and metrics (if available).
+    Returns a dict of DataFrames/Series.
+    """
+    t = yf.Ticker(ticker)
+    info = t.info  # may be large
+    # Basics: marketCap, trailingPE, forwardPE, profitMargins, revenue, ...
+    fundamentals = {
+        "info": info,
+    }
+    # try financials (yearly)
+    try:
+        fundamentals['financials'] = t.financials
+        fundamentals['balance_sheet'] = t.balance_sheet
+        fundamentals['cashflow'] = t.cashflow
+    except Exception as e:
+        print("Warning: financial statements not available:", e)
+    return fundamentals
+
+def save_price_csv(df: pd.DataFrame, ticker: str):
+    fn = os.path.join(DATA_DIR, f"{ticker}_price.csv")
+    df.to_csv(fn, index=False)
+    print("Saved price to", fn)
+    return fn
+
+if __name__ == "__main__":
+    # Example: fetch for multiple tickers
+    tickers = ["AAPL", "MSFT", "GOOGL"]  # replace with tickers you want
+    for tk in tickers:
+        df = fetch_price_history(tk, start="2019-01-01")
+        save_price_csv(df, tk)
+"""
+features.py
+- Create technical indicators + financial-ratio style features
+- Build supervised labels (eg. next-day return, direction)
+"""
+import pandas as pd
+import numpy as np
+from ta import add_all_ta_features
+from ta.utils import dropna
+
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Uses 'ta' lib to add indicators. Expects columns: date, open, high, low, close, volume
+    """
+    df = df.copy()
+    df = dropna(df)
+    # ta expects lowercase ohlc names: open, high, low, close, volume
+    df = add_all_ta_features(
+        df, open="open", high="high", low="low", close="close", volume="volume", fillna=True
+    )
+    return df
+
+def add_return_labels(df: pd.DataFrame, horizon:int=1):
+    """
+    Adds future returns and binary direction label
+    """
+    df = df.copy()
+    df['adj_close'] = df.get('close', df.get('adj_close', df['close']))
+    df['future_close'] = df['adj_close'].shift(-horizon)
+    df['future_return'] = (df['future_close'] - df['adj_close']) / df['adj_close']
+    df['target_up'] = (df['future_return'] > 0).astype(int)
+    # drop last rows with NaN future
+    df = df.dropna(subset=['future_close'])
+    return df
+
+def basic_financial_ratios_from_info(info: dict):
+    """
+    Extract a few ratios from yfinance info dict. This is approximate since info keys vary.
+    """
+    ratios = {}
+    try:
+        market_cap = info.get('marketCap', np.nan)
+        trailing_pe = info.get('trailingPE', np.nan)
+        forward_pe = info.get('forwardPE', np.nan)
+        price_to_book = info.get('priceToBook', np.nan)
+        pb = price_to_book
+        pyg = info.get('pegRatio', np.nan)
+        ratios.update({
+            'market_cap': market_cap,
+            'trailing_pe': trailing_pe,
+            'forward_pe': forward_pe,
+            'price_to_book': pb,
+            'peg': pyg
+        })
+    except Exception:
+        pass
+    return ratios
+
+def prepare_ml_dataset(price_df: pd.DataFrame, ticker: str, horizon:int=1):
+    """
+    Full pipeline for a single ticker returns X, y, feature names, and the processed df.
+    """
+    df = price_df.copy()
+    df = df.sort_values('date').reset_index(drop=True)
+    df = add_technical_indicators(df)
+    df = add_return_labels(df, horizon=horizon)
+    # Drop non-feature columns
+    drop_cols = ['date','ticker','future_close','adj_close'] if 'adj_close' in df.columns else ['date','ticker','future_close']
+    X = df.drop(columns=drop_cols + ['future_return','target_up'])
+    y = df['target_up']
+    return X, y, df
+"""
+models.py
+- Classic ML models (RandomForest, XGBoost) and an example LSTM model for price sequence prediction.
+"""
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from xgboost import XGBClassifier
+
+# Simple wrapper to train and evaluate classic models
+def train_random_forest(X_train, y_train, X_val=None, y_val=None, n_estimators=200, random_state=42):
+    model = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state, n_jobs=-1)
+    model.fit(X_train, y_train)
+    if X_val is not None:
+        preds = model.predict(X_val)
+        acc = accuracy_score(y_val, preds)
+        print("RF Validation accuracy:", acc)
+    return model
+
+def train_xgboost(X_train, y_train, X_val=None, y_val=None):
+    model = XGBClassifier(n_estimators=200, use_label_encoder=False, eval_metric='logloss')
+    model.fit(X_train, y_train)
+    if X_val is not None:
+        preds = model.predict(X_val)
+        print("XGB Validation accuracy:", accuracy_score(y_val, preds))
+    return model
+
+# Save/load utility
+def save_model(model, path):
+    joblib.dump(model, path)
+    print("Saved model to", path)
+
+def load_model(path):
+    return joblib.load(path)
+"""
+train.py
+- End-to-end training script for multiple tickers
+- Saves trained model, scaler, and sample datasets
+"""
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from src.data_fetch import fetch_price_history, save_price_csv, fetch_fundamentals
+from src.features import prepare_ml_dataset, basic_financial_ratios_from_info
+from src.models import train_random_forest, save_model
+import joblib
+
+OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "artifacts")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+def run_training(tickers, start="2018-01-01", test_size=0.2, horizon=1):
+    combined = []
+    for t in tickers:
+        df = fetch_price_history(t, start=start)
+        save_price_csv(df, t)
+        X, y, processed_df = prepare_ml_dataset(df, t, horizon=horizon)
+        # keep an identifier
+        X['ticker'] = t
+        X['date'] = processed_df['date'].values[:len(X)]
+        combined.append((X, y))
+
+    # Combine datasets (simple approach)
+    X_all = pd.concat([x for x, y in combined], ignore_index=True)
+    y_all = pd.concat([y for x, y in combined], ignore_index=True)
+    # Drop rows with inf or NaN
+    X_all = X_all.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how='all')
+    X_all = X_all.dropna()
+    # align y
+    y_all = y_all.iloc[:len(X_all)]
+    # train/test split
+    X_train, X_test, y_train, y_test = train_test_split(X_all.drop(columns=['ticker','date']), y_all, test_size=test_size, shuffle=True, random_state=42)
+    # scale
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    # train model
+    rf = train_random_forest(X_train_scaled, y_train, X_test_scaled, y_test)
+    # save artifacts
+    save_model(rf, os.path.join(OUT_DIR, "rf_model.joblib"))
+    joblib.dump(scaler, os.path.join(OUT_DIR, "scaler.joblib"))
+    # evaluation
+    preds = rf.predict(X_test_scaled)
+    from sklearn.metrics import classification_report, accuracy_score
+    print("Final test accuracy:", accuracy_score(y_test, preds))
+    print(classification_report(y_test, preds))
+    return rf, scaler
+
+if __name__ == "__main__":
+    # Example run — change tickers to the companies you want to analyze
+    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN"]  
+    run_training(tickers, start="2019-01-01")
+"""
+eval.py
+- Utilities to evaluate and plot model performance and feature importance
+"""
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import pandas as pd
+
+def plot_confusion_matrix(cm, labels):
+    plt.figure(figsize=(5,4))
+    sns.heatmap(cm, annot=True, fmt='d', xticklabels=labels, yticklabels=labels)
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.show()
+
+def plot_feature_importances(model, feature_names, top_n=30):
+    importances = model.feature_importances_
+    idx = np.argsort(importances)[-top_n:]
+    plt.figure(figsize=(8,6))
+    plt.barh(range(len(idx)), importances[idx], align='center')
+    plt.yticks(range(len(idx)), [feature_names[i] for i in idx])
+    plt.title("Feature Importances")
+    plt.show()
+"""
+app_streamlit.py
+- Minimal Streamlit app to demo loading artifacts and making predictions
+Run: streamlit run src/app_streamlit.py
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+import joblib
+from src.data_fetch import fetch_price_history
+from src.features import add_technical_indicators, add_return_labels
+
+@st.cache_data
+def load_artifacts():
+    import os
+    base = os.path.join(os.path.dirname(__file__), "..", "artifacts")
+    model = joblib.load(os.path.join(base, "rf_model.joblib"))
+    scaler = joblib.load(os.path.join(base, "scaler.joblib"))
+    return model, scaler
+
+def prepare_latest_features(price_df):
+    df = price_df.copy().sort_values('date').reset_index(drop=True)
+    df = add_technical_indicators(df)
+    # select last row features used in training (matching train columns necessary)
+    return df
+
+st.title("Financial AI — Demo")
+st.sidebar.title("Settings")
+ticker = st.sidebar.text_input("Ticker", value="AAPL")
+start = st.sidebar.date_input("Start Date", value=pd.to_datetime("2019-01-01"))
+
+if st.sidebar.button("Fetch & Predict"):
+    model, scaler = load_artifacts()
+    df = fetch_price_history(ticker, start=start.strftime("%Y-%m-%d"))
+    df_features = prepare_latest_features(df)
+    # get last row
+    last_row = df_features.iloc[-1:]
+    # Drop columns that won't be in model (date,ticker,close,open,...). You must align with training features!
+    # For demo assume training used all ta.* columns:
+    drop_cols = ['date','ticker'] if 'ticker' in last_row.columns else ['date']
+    X_last = last_row.drop(columns=[c for c in drop_cols if c in last_row.columns])
+    # ensure same ordering and columns — this demo assumes columns align; in practice save feature list at training
+    # scale
+    X_scaled = scaler.transform(X_last)
+    pred = model.predict(X_scaled)[0]
+    proba = model.predict_proba(X_scaled)[0]
+    st.write("Prediction (1 = price up next day):", int(pred))
+    st.write("Probabilities:", proba)
+    st.write("Latest price data:")
+    st.dataframe(df.tail(5))
+"""
+utils.py - small helper functions
+"""
+import pandas as pd
+import numpy as np
+
+def save_df_csv(df, path):
+    df.to_csv(path, index=False)
+    return path
+
+def load_df_csv(path):
+    return pd.read_csv(path)
